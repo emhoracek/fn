@@ -5,8 +5,9 @@
 module Site where
 
 import           Control.Lens
-import           Control.Logging
+import           Control.Monad                     (mplus)
 import           Data.Default                      (def)
+import qualified Data.Map                          as M
 import           Data.Maybe                        (fromMaybe)
 import           Data.Monoid
 import           Data.Pool
@@ -18,18 +19,17 @@ import qualified Data.Text.Read                    as T
 import qualified Data.Vault.Lazy                   as Vault
 import qualified Database.PostgreSQL.Simple        as PG
 import qualified Database.Redis                    as R
-import           Heist
+import           Larceny
 import           Network.HTTP.Types.Method
 import           Network.Wai
 import           Network.Wai.Session               (Session, withSession)
 import           Network.Wai.Session.ClientSession (clientsessionStore)
-import qualified Text.XmlHtml                      as X
 import           Web.ClientSession                 (randomKey)
 import           Web.Fn
-import           Web.Fn.Extra.Heist
 
 data Ctxt = Ctxt { _req   :: FnRequest
-                 , _heist :: FnHeistState Ctxt
+                 , _subs  :: Ctxt -> Substitutions
+                 , _lib   :: Library
                  , _db    :: Pool PG.Connection
                  , _redis :: R.Connection
                  , _sess  :: Vault.Key (Session IO Text Text)
@@ -40,32 +40,35 @@ makeLenses ''Ctxt
 instance RequestContext Ctxt where
   requestLens = req
 
-instance HeistContext Ctxt where
-  getHeist = _heist
+exampleSubs :: Ctxt -> Substitutions
+exampleSubs ctxt = do
+  fills [ ("current-url", useAttrs ((a "n" % a "prefix") (currentUrlFill ctxt)))
+        , ("hello", text "hello") ]
 
-exampleSplices :: Splices (FnSplice Ctxt)
-exampleSplices = do
-  tag "current-url" (attr "n" &= attrOpt "prefix") currentUrlSplice
-  tag' "hello" helloSplice
+currentUrlFill :: Ctxt -> Int -> Text -> Text -> IO Text
+currentUrlFill ctxt rep pref _tpl =
+  let u = T.decodeUtf8 . rawPathInfo $ ctxt ^. req . _1
+      pref' = Just pref in
+  return $ T.concat $ replicate rep (fromMaybe "" pref' <> u)
 
-currentUrlSplice :: Ctxt -> X.Node -> Int -> Maybe Text -> FnSplice Ctxt
-currentUrlSplice ctxt _ rep pref =
-  let u = T.decodeUtf8 . rawPathInfo $ ctxt ^. req . _1 in
-  return $
-    replicate rep (X.TextNode (fromMaybe "" pref <> u))
+larcenyServe :: Ctxt ->
+                IO (Maybe Response)
+larcenyServe ctxt =
+  let p = pathInfo . fst $ getRequest ctxt in
+  mplus <$> renderLarceny ctxt (T.intercalate "/" p)
+        <*> renderLarceny ctxt (T.intercalate "/" (p ++ ["index"]))
 
-helloSplice :: Ctxt -> X.Node -> FnSplice Ctxt
-helloSplice _ _ = return [ X.TextNode "hello" ]
-
+renderLarceny :: Ctxt ->
+                 Text ->
+                 IO (Maybe Response)
+renderLarceny ctxt name =
+  do let tpl = (ctxt ^. lib) M.! [name]
+     t <- runTemplate tpl [name] ((ctxt ^. subs) ctxt) (ctxt ^. lib)
+     okHtml t
 
 initializer :: IO Ctxt
 initializer =
-  do hs' <- heistInit
-              ["templates"]
-              exampleSplices
-     let hs = case hs' of
-                Left ers -> errorL' ("Heist failed to load templates: \n" <> T.intercalate "\n" (map T.pack ers))
-                Right hs'' -> hs''
+  do tpls <- Larceny.loadTemplates "templates"
      pgpool <- createPool (PG.connect (PG.ConnectInfo "localhost"
                                                       5432
                                                       "fn_user"
@@ -74,7 +77,7 @@ initializer =
                           PG.close 1 60 20
      rconn <- R.connect R.defaultConnectInfo
      session <- Vault.newKey
-     return (Ctxt defaultFnRequest hs pgpool rconn session)
+     return (Ctxt defaultFnRequest exampleSubs tpls pgpool rconn session)
 
 app :: IO (Application, IO ())
 app =
@@ -103,7 +106,7 @@ site ctxt =
              ,path "redis" // segment /? paramOpt "set" ==> redisHandler
              ,path "session" ==> sessionHandler
              ,path "file" ==> fileHandler
-             ,anything ==> heistServe
+             ,anything ==> larcenyServe
              ,anything ==> staticServe "static"
              ]
     `fallthrough` notFoundText "Page not found."
@@ -123,7 +126,7 @@ paramManyHandler _ is =
 
 templateHandler :: Ctxt -> IO (Maybe Response)
 templateHandler ctxt =
-  do t <- render ctxt "template"
+  do t <- renderLarceny ctxt "template"
      case t of
        Nothing -> okText "Could not find template. Did you start application from example directory?"
        Just _ -> return t
@@ -161,7 +164,7 @@ sessionHandler ctxt =
      okText (T.pack (show cur))
 
 fileHandler :: Ctxt -> IO (Maybe Response)
-fileHandler ctxt = route ctxt [method GET ==> const (render ctxt "file")
+fileHandler ctxt = route ctxt [method GET ==> const (renderLarceny ctxt "file")
                               ,method POST /? file "f" ==> fileH]
   where fileH _ (File name ct _) =
           okText ("Got file named " <> name <> " of type " <> ct)
